@@ -2,6 +2,7 @@ import { safeFetch } from "./net";
 import { extract, extractOkRu, findIframes, SUB_EXT, VIDEO_EXT, type MediaRef, type SubRef } from "./extract";
 import { parseHls, parseMpd } from "./hls";
 import { unpackAll } from "./unpack";
+import { browserCapture } from "./browser";
 
 export const CREATOR = "Azmi Ganteng";
 const UA = "Mozilla/5.0 (compatible; StreamUrlExtractor/1.0; +analysis-tool)";
@@ -21,7 +22,8 @@ async function gather(html: string, base: string, headers: Record<string, string
   return html + "\n" + unpackAll(html) + "\n" + parts.join("\n");
 }
 
-export async function analyze(pageUrl: string, referer?: string) {
+export async function analyze(pageUrl: string, referer?: string, opts: { origin?: string; browser?: boolean } = {}) {
+  let blocked = false;
   const t0 = Date.now();
   const diagnostics: string[] = [];
   const limitations: string[] = [];
@@ -50,19 +52,23 @@ export async function analyze(pageUrl: string, referer?: string) {
     else if (SUB_EXT.includes(ext0)) { subs.push({ url: u.href, ext: ext0, label: null, lang: null, kind: null, via: "input" }); }
     else {
       const page = await safeFetch(u.href, { headers: pageHeaders });
-      out.page_fetch = { status: page.status, final_url: page.finalUrl, content_type: page.contentType, referer_sent: referer || null };
+      const title = page.body.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim().slice(0, 120) ?? null;
+      const snippet = page.body
+        .replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/g, " ")
+        .replace(/\s+/g, " ").trim().slice(0, 200);
+      out.page_fetch = { status: page.status, final_url: page.finalUrl, content_type: page.contentType, referer_sent: referer || null, title, snippet };
+      if (/not found|deleted|removed|copyright|error code|unavailable/i.test(`${title} ${snippet}`)) {
+        limitations.push(`Halaman membalas HTTP ${page.status} tetapi isinya tampak seperti pesan error/konten tidak tersedia. Periksa apakah ID/episode benar-benar ada.`);
+      }
       if (!page.ok) {
         diagnostics.push(`Server sumber membalas HTTP ${page.status} untuk request dari backend.`);
         if ([401, 403, 404, 429].includes(page.status)) {
           limitations.push(
-            "Halaman sumber menolak request ini. 'Not Found' pada akses langsung biasanya berasal dari validasi konteks embed di sisi server: " +
-            "(1) header Referer/Origin harus dari domain yang diizinkan, (2) header Sec-Fetch-Dest/Sec-Fetch-Site yang dikirim browser berbeda antara tab dan iframe, " +
-            "(3) cookie/sesi/token, atau (4) proteksi bot/IP (server cloud sering diblokir). Tool ini tidak menembus proteksi tersebut. " +
-            "Jika Anda berwenang meng-embed halaman ini, isi kolom 'Referer' dengan domain Anda yang terdaftar.");
+            "Halaman sumber menolak request ini. Penyebab umum: validasi konteks embed (Referer/Origin/Sec-Fetch-Dest), cookie/sesi/token, atau proteksi bot/IP (server cloud sering diblokir). " +
+            "Tool ini tidak menembus proteksi tersebut. Jika Anda berwenang meng-embed halaman ini, tambahkan ?referer=https://domain-anda.com/");
         }
-        return done("blocked");
-      }
-      if (/mpegurl/i.test(page.contentType) || page.body.trimStart().startsWith("#EXTM3U")) media.push({ url: page.finalUrl, ext: "m3u8", via: "page" });
+        blocked = true;
+      } else if (/mpegurl/i.test(page.contentType) || page.body.trimStart().startsWith("#EXTM3U")) media.push({ url: page.finalUrl, ext: "m3u8", via: "page" });
       else {
         const body = await gather(page.body, page.finalUrl, pageHeaders);
         const r = extract(body, page.finalUrl, "page");
@@ -76,13 +82,28 @@ export async function analyze(pageUrl: string, referer?: string) {
           } catch (e: any) { diagnostics.push(`Iframe ${f} gagal: ${e.message}`); }
         }
         if (!media.length) limitations.push(
-          "Tidak ada URL media di HTML/JS statis. Banyak player memuat sumber lewat request XHR/fetch saat runtime (butuh browser). " +
-          "Backend serverless ini tidak menjalankan browser headless, jadi sumber seperti itu tidak bisa dideteksi. URL iframe/halaman embed BUKAN URL video.");
+          "Tidak ada URL media di HTML/JS statis. Player kemungkinan memuat sumber lewat request XHR/fetch saat runtime. URL iframe/halaman embed BUKAN URL video.");
       }
     }
   } catch (e: any) {
     out.error = e.name === "AbortError" ? "Timeout saat mengambil halaman sumber." : e.message;
     return done("failed");
+  }
+
+  // Fallback otomatis: browser headless merekam request jaringan player (iframe pada halaman host).
+  if (!media.length && opts.browser !== false && opts.origin && !VIDEO_EXT.includes(ext0) && !SUB_EXT.includes(ext0)) {
+    try {
+      let host = opts.origin;
+      if (referer) { try { host = new URL(referer).origin; } catch {} }
+      const cap = await browserCapture(u.href, host);
+      diagnostics.push(`Mode browser (host embed: ${host}): ${cap.media.length} request media terekam.`);
+      for (const m of cap.media) {
+        if (SUB_EXT.includes(m.ext)) subs.push({ url: m.url, ext: m.ext, label: null, lang: null, kind: null, via: "browser" });
+        else media.push({ url: m.url, ext: m.ext, via: "browser" });
+      }
+      for (const t of cap.texts) { const r = extract(t.body, t.url, "browser-xhr"); media.push(...r.media, ...extractOkRu(t.body, "browser-xhr")); subs.push(...r.subs); }
+      if (media.length) { blocked = false; limitations.length = 0; }
+    } catch (e: any) { diagnostics.push(`Mode browser gagal: ${e?.message || e}`); }
   }
 
   media = [...new Map(media.map((m) => [m.url, m])).values()].slice(0, 12);
@@ -134,12 +155,12 @@ export async function analyze(pageUrl: string, referer?: string) {
   out.subtitles = subList;
   if (primary) {
     out.video = { url: primary.url, type: primary.type, accessible: primary.accessible, playlist_kind: primary.kind, qualities: primary.qualities.map((q: any) => ({ ...q })) };
-    if (primary.accessible === false) limitations.push("URL video ditemukan di halaman tetapi tidak bisa diakses dari backend (kemungkinan butuh Referer/token/cookie). Preview di browser mungkin juga gagal.");
+    if (primary.accessible === false) limitations.push("URL video ditemukan tetapi tidak bisa diakses dari backend (kemungkinan butuh Referer/token/cookie).");
   }
   out.success = !!primary;
   if (primary && !primary.qualities.length) {
     const prog = analyzed.filter((a) => a.quality && a.accessible !== false);
     if (prog.length > 1) out.video.qualities = prog.map((a) => ({ label: a.quality, url: a.url, width: null, height: null, bandwidth: null, codecs: null, frame_rate: null }));
   }
-  return done(primary ? "completed" : out.status === "failed" ? "no_sources_found" : "no_sources_found");
+  return done(primary ? "completed" : blocked ? "blocked" : "no_sources_found");
 }
